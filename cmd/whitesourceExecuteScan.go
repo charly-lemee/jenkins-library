@@ -260,9 +260,14 @@ func checkAndReportScanResults(ctx context.Context, config *ScanOptions, scan *w
 
 	checkErrors := []string{}
 
-	rPath, err := checkPolicyViolations(config, scan, sys, utils, reportPaths, influx)
+	rPath, err := checkPolicyViolations(ctx, config, scan, sys, utils, reportPaths, influx)
+
 	if err != nil {
-		checkErrors = append(checkErrors, fmt.Sprint(err))
+		if !config.FailOnSevereVulnerabilities && log.GetErrorCategory() == log.ErrorCompliance {
+			log.Entry().Infof("policy violation(s) found - step will only create data but not fail due to setting failOnSevereVulnerabilities: false")
+		} else {
+			checkErrors = append(checkErrors, fmt.Sprint(err))
+		}
 	}
 	reportPaths = append(reportPaths, rPath)
 
@@ -270,7 +275,11 @@ func checkAndReportScanResults(ctx context.Context, config *ScanOptions, scan *w
 		rPaths, err := checkSecurityViolations(ctx, config, scan, sys, utils, influx)
 		reportPaths = append(reportPaths, rPaths...)
 		if err != nil {
-			checkErrors = append(checkErrors, fmt.Sprint(err))
+			if !config.FailOnSevereVulnerabilities && log.GetErrorCategory() == log.ErrorCompliance {
+				log.Entry().Infof("policy violation(s) found - step will only create data but not fail due to setting failOnSevereVulnerabilities: false")
+			} else {
+				checkErrors = append(checkErrors, fmt.Sprint(err))
+			}
 		}
 	}
 
@@ -312,8 +321,13 @@ func createWhiteSourceProduct(config *ScanOptions, sys whitesource) (string, err
 
 func resolveProjectIdentifiers(config *ScanOptions, scan *ws.Scan, utils whitesourceUtils, sys whitesource) error {
 	if len(scan.AggregateProjectName) > 0 && (len(config.Version)+len(config.CustomScanVersion) > 0) {
-		if config.Version == "" {
+		if len(config.CustomScanVersion) > 0 {
+			log.Entry().Infof("Using custom version: %v", config.CustomScanVersion)
 			config.Version = config.CustomScanVersion
+		} else if len(config.Version) > 0 {
+			log.Entry().Infof("Resolving product version from default provided '%s' with versioning '%s'", config.Version, config.VersioningModel)
+			config.Version = versioning.ApplyVersioningModel(config.VersioningModel, config.Version)
+			log.Entry().Infof("Resolved product version '%s'", config.Version)
 		}
 	} else {
 		options := &versioning.Options{
@@ -480,14 +494,16 @@ func executeScan(config *ScanOptions, scan *ws.Scan, utils whitesourceUtils) err
 	return nil
 }
 
-func checkPolicyViolations(config *ScanOptions, scan *ws.Scan, sys whitesource, utils whitesourceUtils, reportPaths []piperutils.Path, influx *whitesourceExecuteScanInflux) (piperutils.Path, error) {
+func checkPolicyViolations(ctx context.Context, config *ScanOptions, scan *ws.Scan, sys whitesource, utils whitesourceUtils, reportPaths []piperutils.Path, influx *whitesourceExecuteScanInflux) (piperutils.Path, error) {
 	policyViolationCount := 0
+	allAlerts := []ws.Alert{}
 	for _, project := range scan.ScannedProjects() {
 		alerts, err := sys.GetProjectAlertsByType(project.Token, "REJECTED_BY_POLICY_RESOURCE")
 		if err != nil {
 			return piperutils.Path{}, fmt.Errorf("failed to retrieve project policy alerts from WhiteSource: %w", err)
 		}
 		policyViolationCount += len(alerts)
+		allAlerts = append(allAlerts, alerts...)
 	}
 
 	violations := struct {
@@ -547,11 +563,24 @@ func checkPolicyViolations(config *ScanOptions, scan *ws.Scan, sys whitesource, 
 
 	if policyViolationCount > 0 {
 		influx.whitesource_data.fields.policy_violations = policyViolationCount
-		if config.FailOnSevereVulnerabilities {
-			log.SetErrorCategory(log.ErrorCompliance)
-			return policyReport, fmt.Errorf("%v policy violation(s) found", policyViolationCount)
+		log.SetErrorCategory(log.ErrorCompliance)
+
+		if config.CreateResultIssue && policyViolationCount > 0 && len(config.GithubToken) > 0 && len(config.GithubAPIURL) > 0 && len(config.Owner) > 0 && len(config.Repository) > 0 {
+			log.Entry().Debugf("Creating result issues for %v alert(s)", policyViolationCount)
+			issueDetails := make([]reporting.IssueDetail, len(allAlerts))
+			piperutils.CopyAtoB(allAlerts, issueDetails)
+			gh := reporting.GitHub{
+				Owner:         &config.Owner,
+				Repository:    &config.Repository,
+				Assignees:     &config.Assignees,
+				IssueService:  utils.GetIssueService(),
+				SearchService: utils.GetSearchService(),
+			}
+			if err := gh.UploadMultipleReports(ctx, &issueDetails); err != nil {
+				return policyReport, fmt.Errorf("failed to upload reports to GitHub for %v policy violations: %w", policyViolationCount, err)
+			}
 		}
-		log.Entry().Infof("%v policy violation(s) found - step will only create data but not fail due to setting failOnSevereVulnerabilities: false", policyViolationCount)
+		return policyReport, fmt.Errorf("%v policy violation(s) found", policyViolationCount)
 	}
 
 	return policyReport, nil
@@ -900,7 +929,6 @@ func persistScannedProjects(config *ScanOptions, scan *ws.Scan, commonPipelineEn
 }
 
 // create toolrecord file for whitesource
-//
 func createToolRecordWhitesource(utils whitesourceUtils, workspace string, config *whitesourceExecuteScanOptions, scan *ws.Scan) (string, error) {
 	record := toolrecord.New(utils, workspace, "whitesource", config.ServiceURL)
 	wsUiRoot := "https://saas.whitesourcesoftware.com"
